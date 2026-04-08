@@ -1,17 +1,30 @@
+import asyncio
 import importlib.util
 import inspect
 import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from action import ActionMeta
+from executor import ExecutorManager
 
 
 class ActionDispatcher:
     """负责加载、注册、查找和执行 action。"""
 
-    def __init__(self):
+    def __init__(self, max_concurrency: int = 8):
         self._registered_actions: Dict[str, Union[Callable, Type]] = {}
+        self._executor_manager = ExecutorManager.get_instance()
+        self._max_concurrency = max_concurrency
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        """获取并发信号量（惰性创建）。"""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        return self._semaphore
 
     @property
     def registered_actions(self) -> Dict[str, Union[Callable, Type]]:
@@ -77,8 +90,9 @@ class ActionDispatcher:
 
         完整流程：
         1. 从注册表查找 action 函数和元数据
-        2. 执行函数（支持 sync/async）
-        3. 用 output_mapping 转换返回值
+        2. 通过 Semaphore 控制并发
+        3. 同步函数投递到线程池，async 函数直接 await
+        4. 用 output_mapping 转换返回值
 
         Args:
             action_name: action 名称
@@ -99,21 +113,19 @@ class ActionDispatcher:
             self._registered_actions[action_name] = fn
 
         meta: ActionMeta = getattr(fn, "action_meta", {})
+        executor_name = meta.get("executor", "default")
 
         print(f"\n[Dispatcher] 执行 action: '{action_name}'")
         print(f"  函数: {fn.__name__ if hasattr(fn, '__name__') else fn.__class__.__name__}")
-        print(f"  元数据: system={meta.get('is_system_action')}, has_mapping={meta.get('output_mapping') is not None}")
+        print(f"  元数据: system={meta.get('is_system_action')}, "
+              f"has_mapping={meta.get('output_mapping') is not None}, "
+              f"executor={executor_name}")
         print(f"  参数: {list(params.keys())}")
 
-        # 执行
-        if inspect.isfunction(fn) or inspect.ismethod(fn):
-            result = fn(**params)
-            if inspect.iscoroutine(result):
-                result = await result
-        elif hasattr(fn, "run") and callable(getattr(fn, "run")):
-            result = fn.run(**params)
-        else:
-            result = fn(**params)
+        # 通过 Semaphore 控制并发
+        semaphore = self._get_semaphore()
+        async with semaphore:
+            result = await self._run_action(fn, params, executor_name)
 
         print(f"  原始返回值: {result}")
 
@@ -123,6 +135,41 @@ class ActionDispatcher:
             mapped = output_mapping(result)
             print(f"  output_mapping 转换后: {result} → {mapped}")
             return mapped
+
+        return result
+
+    async def _run_action(self, fn: Any, params: dict, executor_name: str) -> Any:
+        """根据函数类型选择执行方式。
+
+        sync 函数 → 投递到线程池
+        async 函数 → 直接 await
+        """
+        loop = asyncio.get_running_loop()
+
+        # 获取可调用的函数
+        callable_fn = fn
+        if inspect.isclass(fn):
+            if hasattr(fn, "run") and callable(getattr(fn, "run")):
+                callable_fn = fn.run
+            else:
+                callable_fn = fn
+
+        is_sync = not asyncio.iscoroutinefunction(callable_fn)
+
+        if is_sync:
+            # 同步函数 → 投递到线程池
+            executor = self._executor_manager.get(executor_name)
+            print(f"  执行方式: sync → 线程池 [{executor_name}]")
+            if params:
+                result = await loop.run_in_executor(executor, partial(callable_fn, **params))
+            else:
+                result = await loop.run_in_executor(executor, callable_fn)
+        else:
+            # async 函数 → 直接 await
+            print(f"  执行方式: async → 事件循环")
+            result = callable_fn(**params)
+            if inspect.iscoroutine(result):
+                result = await result
 
         return result
 
