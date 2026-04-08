@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+
+# Test
+.pytest_cache/
+
+# Distribution
+dist/
+build/
+*.egg-info/
